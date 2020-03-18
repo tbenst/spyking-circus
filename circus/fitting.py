@@ -36,6 +36,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
     tmp_limits = params.get('fitting', 'amp_limits').replace('(', '').replace(')', '').split(',')
     tmp_limits = [float(v) for v in tmp_limits]
     amp_auto = params.getboolean('fitting', 'amp_auto')
+    refractory = params.getint('fitting', 'refractory')
     auto_nb_chances = params.getboolean('fitting', 'auto_nb_chances')
     if auto_nb_chances:
         nb_chances = io.load_data(params, 'nb_chances')
@@ -56,6 +57,8 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
     inv_nodes = numpy.zeros(n_total, dtype=numpy.int32)
     inv_nodes[nodes] = numpy.arange(len(nodes))
     data_file.open()
+    display_profiling = True
+
     #################################################################
 
     if use_gpu:
@@ -265,10 +268,13 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
     if comm.rank == 0:
         to_explore = get_tqdm_progressbar(params, to_explore)
 
+    import time
+
     for gcount, gidx in enumerate(to_explore):
         # print "Node", comm.rank, "is analyzing chunk", gidx, "/", nb_chunks, " ..."
         # # We need to deal with the borders by taking chunks of size [0, chunck_size + template_shift].
 
+        t1 = time.time()
         is_first = data_file.is_first_chunk(gidx, nb_chunks)
         is_last = data_file.is_last_chunk(gidx, nb_chunks)
 
@@ -301,7 +307,11 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
         local_chunk, t_offset = data_file.get_data(gidx, chunk_size, padding, nodes=nodes)           
         len_chunk = len(local_chunk)
+        if display_profiling:
+            t_loading = time.time() - t1
+            print("Time loading", t_loading)
 
+        t2 = time.time()
         if do_spatial_whitening:
             if use_gpu:
                 local_chunk = cmt.CUDAMatrix(local_chunk, copy_on_host=False)
@@ -311,8 +321,13 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         if do_temporal_whitening:
             local_chunk = scipy.ndimage.filters.convolve1d(local_chunk, temporal_whitening, axis=0, mode='constant')
 
+        if display_profiling:
+            t_whitening = time.time() - t2
+            print("Time whitening", t_whitening)
+
         # Extracting peaks.
 
+        t3 = time.time()
         all_found_spikes = {}
         if collect_all:
             for i in range(n_e):
@@ -386,6 +401,10 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
         nb_local_peak_times = len(local_peaktimes)
 
+        if display_profiling:
+            t_peaking = time.time() - t3
+            print("Time peak detection", t_peaking)
+
         if full_gpu:
             # all_indices = cmt.CUDAMatrix(all_indices)
             # tmp_gpu = cmt.CUDAMatrix(local_peaktimes.reshape((1, nb_local_peak_times)), copy_on_host=False)
@@ -399,9 +418,15 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
             else:
                 c_local_chunk = None  # default assignment (for PyCharm code inspection)
 
+            t4 = time.time()
             sub_mat = local_chunk[local_peaktimes[:, None] + temp_window]
             sub_mat = sub_mat.transpose(2, 1, 0).reshape(size_window, nb_local_peak_times)
 
+            if display_profiling:
+                t_extracting = time.time() - t4
+                print("Time extracting snippets", t_extracting)
+
+            t5 = time.time()
             del local_chunk
 
             if use_gpu:
@@ -412,6 +437,9 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
             del sub_mat
 
+            if display_profiling:
+                t_scalar = time.time() - t5
+                print("Time scalar product", t_scalar)
             local_restriction = (t_offset, t_offset + chunk_size)
             all_spikes = local_peaktimes + g_offset
 
@@ -448,6 +476,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
             nb_argmax = n_tm
             best_indices = numpy.zeros(0, dtype=numpy.int32)
 
+            t6 = time.time()
             while numpy.mean(failure) < total_nb_chances:
 
                 # Is there a way to update sub_b * mask at the same time?
@@ -543,6 +572,11 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
                         result['templates'] += [best_template_index]
                     # Mark current matching as tried.
                     b[best_template_index, peak_index] = -numpy.inf
+
+                    # Even better, we should ban this template from beeing used in nearby peaks
+                    is_neighbor = np.where(np.abs(peak_data) <= refractory)[0]                    
+                    b[best_template_index, is_neighbor] = -numpy.inf                    
+
                     # Save debug data.
                     if debug:
                         result_debug['chunk_nbs'] += [gidx]
@@ -586,6 +620,10 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
                 iteration_nb += 1
 
+            if display_profiling:
+                t_looping = time.time() - t6
+                print("Time looping", t_looping)
+
             spikes_to_write = numpy.array(result['spiketimes'], dtype=numpy.uint32)
             amplitudes_to_write = numpy.array(result['amplitudes'], dtype=numpy.float32)
             templates_to_write = numpy.array(result['templates'], dtype=numpy.uint32)
@@ -593,6 +631,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
             spiketimes_file.write(spikes_to_write.tostring())
             amplitudes_file.write(amplitudes_to_write.tostring())
             templates_file.write(templates_to_write.tostring())
+
 
             if collect_all:
 
@@ -654,6 +693,8 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
             if full_gpu:
                 del b, data
+
+        sys.stderr.flush()
 
     sys.stderr.flush()
 
