@@ -11,7 +11,7 @@ import h5py
 import scipy.linalg
 import scipy.sparse
 
-from circus.shared.files import load_data, write_datasets, get_overlaps, load_data_memshared, get_stas
+from circus.shared.files import load_data, write_datasets, get_overlaps, load_data_memshared, get_stas, load_sp_memshared, load_sp
 from circus.shared.utils import get_tqdm_progressbar, get_shared_memory_flag, dip, dip_threshold, \
     batch_folding_test_with_MPA, bhatta_dist, nd_bhatta_dist, test_if_support, test_if_purity
 from circus.shared.messages import print_and_log
@@ -735,6 +735,8 @@ def merging_cc(params, nb_cpu, nb_gpu, use_gpu):
     cc_merge = params.getfloat('clustering', 'cc_merge')
     norm = n_e * n_t
     decimation = params.getboolean('clustering', 'decimation')
+    adapted_cc = params.getboolean('clustering', 'adapted_cc')
+    adapted_thr = params.getint('clustering', 'adapted_thr')
 
     if cc_merge < 1:
 
@@ -749,11 +751,11 @@ def merging_cc(params, nb_cpu, nb_gpu, use_gpu):
         SHARED_MEMORY = get_shared_memory_flag(params)
 
         if not SHARED_MEMORY:
-            over_x, over_y, over_data, over_shape = load_data(
+            over_x, over_y, over_data, sub_over, over_sorted, over_shape = load_data(
                 params, 'overlaps-raw', extension='-merging'
             )
         else:
-            over_x, over_y, over_data, over_shape, mpi_memory = load_data_memshared(
+            over_x, over_y, over_data, sub_over, over_sorted, over_shape, mpi_memory = load_data_memshared(
                 params, 'overlaps-raw', extension='-merging', use_gpu=use_gpu, nb_cpu=nb_cpu, nb_gpu=nb_gpu
             )
 
@@ -762,20 +764,37 @@ def merging_cc(params, nb_cpu, nb_gpu, use_gpu):
         distances = numpy.zeros((len(to_explore), nb_temp), dtype=numpy.float32)
 
         res = []
+        res2 = []
         for i in to_explore:
-            res += [i * nb_temp + i + 1, (i + 1) * nb_temp]
+            res += [i * nb_temp, (i + 1) * nb_temp]
+            res2 += [i, i+1]
 
         bounds = numpy.searchsorted(over_x, res, 'left')
+        bounds_2 = numpy.searchsorted(sub_over[over_sorted], res2, 'left')
+
+        duration = over_shape[1] // 2
+        mask_duration = (over_y < duration)
+
+        import gc
 
         for count, i in enumerate(to_explore):
 
             xmin, xmax = bounds[2*count:2*(count+1)]
-            local_x = over_x[xmin:xmax] - (i * nb_temp + i + 1)
+            local_x = over_x[xmin:xmax] - (i * nb_temp)
             local_y = over_y[xmin:xmax]
             local_data = over_data[xmin:xmax]
-            data = scipy.sparse.csr_matrix((local_data, (local_x, local_y)), shape=(nb_temp - (i + 1), over_shape[1]), dtype=numpy.float32)
-            distances[count, i + 1:] = data.max(1).toarray().flatten()
-            del local_x, local_y, local_data, data
+
+            xmin, xmax = bounds_2[2*count:2*(count+1)]
+            nslice = over_sorted[xmin:xmax][mask_duration[over_sorted[xmin:xmax]]]
+
+            local_x = numpy.concatenate((local_x, over_x[nslice] // nb_temp))
+            local_y = numpy.concatenate((local_y, (over_shape[1] - 1) - over_y[nslice]))
+            local_data = numpy.concatenate((local_data, over_data[nslice]))
+
+            data = scipy.sparse.csr_matrix((local_data, (local_x, local_y)), shape=(nb_temp, over_shape[1]), dtype=numpy.float32)
+            distances[count, :] = data.max(1).toarray().flatten()
+            del local_x, local_y, local_data, data, nslice
+            gc.collect()
 
         distances /= norm
 
@@ -785,14 +804,21 @@ def merging_cc(params, nb_cpu, nb_gpu, use_gpu):
             indices = []
             for idx in range(comm.size):
                 indices += list(numpy.arange(idx, nb_temp, comm.size))
-            indices = numpy.argsort(indices)
+            indices = numpy.argsort(indices).astype(numpy.int32)
 
             distances = distances[indices, :]
-            distances = numpy.maximum(distances, distances.T)
+            line = numpy.arange(nb_temp)
+            distances[line, line] = 0
+
+            #distances = numpy.maximum(distances, distances.T)
 
         comm.Barrier()
 
         if comm.rank == 0:
+            if adapted_cc:
+                common_supports = load_data(params, 'common-supports')
+                exponents = numpy.exp(-common_supports/adapted_thr)
+                distances = distances ** exponents
             result = load_data(params, 'clusters')
             to_merge, result = remove(result, distances, cc_merge)
 
@@ -805,7 +831,7 @@ def merging_cc(params, nb_cpu, nb_gpu, use_gpu):
 
         comm.Barrier()
 
-        del result, over_x, over_y, over_data
+        del result, over_x, over_y, over_data, over_sorted, sub_over
 
         if comm.rank == 0:
             os.remove(filename)
@@ -859,25 +885,29 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
     nodes, edges = get_nodes_and_edges(params)
     inv_nodes = numpy.zeros(n_total, dtype=numpy.int32)
     inv_nodes[nodes] = numpy.arange(len(nodes))
+    hdf5_compress = params.getboolean('data', 'hdf5_compress')
+    blosc_compress = params.getboolean('data', 'blosc_compress')
+    tmp_path_loc = os.path.join(os.path.abspath(params.get('data', 'file_out_suff')), 'tmp')
 
     max_snippets = 250
-    sparse_snippets = False
     max_noise_snippets = min(max_snippets, 10000 // N_e)
     # thr_similarity = 0.25
 
     SHARED_MEMORY = get_shared_memory_flag(params)
     
     if SHARED_MEMORY:
-        templates, mpi_memory = load_data_memshared(params, 'templates', normalize=False)
+        templates, mpi_memory_1 = load_data_memshared(params, 'templates', normalize=False, transpose=True)
     else:
         templates = load_data(params, 'templates')
+        templates = templates.T
 
     supports = load_data(params, 'supports')
-    x, n_tm = templates.shape
+    n_tm, x = templates.shape
     nb_temp = int(n_tm // 2)
     norm_templates = load_data(params, 'norm-templates')[:nb_temp]
     norm_templates *= numpy.sqrt(N_e * N_t)
     norm_2 = norm_templates ** 2
+    sindices = inv_nodes[nodes]
 
     # For each electrode, get the local cluster labels.
     indices = {}
@@ -885,6 +915,13 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
         labels = numpy.unique(clusters['clusters_%d' % i])
         labels = labels[labels > -1]
         indices[i] = list(labels)
+
+    mask_intersect = numpy.zeros((nb_temp, nb_temp), dtype=numpy.bool)
+    for i in range(nb_temp):
+        for j in range(i, nb_temp):
+            mask_intersect[i, j] = numpy.any(supports[i]*supports[j])
+
+    mask_intersect = numpy.maximum(mask_intersect, mask_intersect.T)
 
     all_sizes = {}
     all_temp = numpy.arange(comm.rank, nb_temp, comm.size)
@@ -898,13 +935,15 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
     # First we gather all the snippets for the final templates.
 
     clusters_info = {}
-    all_snippets = {}
+    
+    all_snippets = {'all' : {}, 'noise' : {}}
+    for key in ['all', 'noise']:
+        all_snippets[key]['x'] = [numpy.zeros(0, dtype=numpy.int32)]
+        all_snippets[key]['data'] = [numpy.zeros(0, dtype=numpy.float32)]
 
     for i in to_explore:  # for each cluster...
 
         ref_elec = best_elec[i]  # i.e. electrode of the cluster
-        shank_nodes, _ = get_nodes_and_edges(params, shank_with=nodes[ref_elec])
-        sindices = inv_nodes[shank_nodes]
 
         times = clusters['times_%d' % ref_elec]
         labels = clusters['clusters_%d' % ref_elec]
@@ -930,21 +969,16 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
         labels_i = labels[idx_i]
         snippets = get_stas(params, times_i, labels_i, ref_elec, neighs=sindices, nodes=nodes, pos=p)
 
-        if sparse_snippets:
-            snippets[:, ~supports[i], :] = 0
-
         nb_snippets, nb_electrodes, nb_times_steps = snippets.shape
-        snippets = snippets.reshape(nb_snippets, nb_electrodes * nb_times_steps)
-
-        if sparse_snippets:
-            snippets = scipy.sparse.csr_matrix(snippets)
+        snippets = numpy.ascontiguousarray(snippets.reshape(nb_snippets, nb_electrodes * nb_times_steps).T)
 
         for j in range(nb_temp):
-            template = templates[:, j].toarray().ravel()
-            data = snippets.dot(template).astype(numpy.float32)
-            all_snippets[j, i] = data
+            if mask_intersect[i, j]:
+                data = templates[j].dot(snippets)[0].astype(numpy.float32)
+                all_snippets['all']['x'].append((j*nb_temp + i)*numpy.ones(len(data), dtype=numpy.int32))
+                all_snippets['all']['data'].append(data)
 
-        all_sizes[i] = snippets.shape[0]
+        all_sizes[i] = snippets.shape[1]
 
     noise_amplitudes = {}
     for i in range(nb_temp):
@@ -957,8 +991,6 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
 
     for elec in to_explore:
         times = clusters['noise_times_' + str(elec)]
-        shank_nodes, _ = get_nodes_and_edges(params, shank_with=nodes[elec])
-        sindices = inv_nodes[shank_nodes]
 
         idx = len(times)
         idx_i = numpy.random.permutation(idx)[:max_noise_snippets]
@@ -967,42 +999,67 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
         snippets = get_stas(params, times_i, labels_i, elec, neighs=sindices, nodes=nodes, auto_align=False)
 
         nb_snippets, nb_electrodes, nb_times_steps = snippets.shape
-        snippets = snippets.reshape(nb_snippets, nb_electrodes * nb_times_steps)
-
-        if sparse_snippets:
-            snippets = scipy.sparse.csr_matrix(snippets)
+        snippets = numpy.ascontiguousarray(snippets.reshape(nb_snippets, nb_electrodes * nb_times_steps).T)
 
         for j in range(nb_temp):
-            template = templates[:, j].toarray().ravel()
-            data = snippets.dot(template).astype(numpy.float32)
+            data = templates[j].dot(snippets)[0].astype(numpy.float32)
             noise_amplitudes[j].append(data)
 
     for i in range(nb_temp):
         amplitudes = numpy.concatenate(noise_amplitudes.pop(i))
-        all_snippets[i, 'noise'] = amplitudes
+        all_snippets['noise']['x'].append(i*numpy.ones(len(amplitudes), dtype=numpy.int32))
+        all_snippets['noise']['data'].append(amplitudes)
 
-    for i in range(nb_temp):
-        for j in range(nb_temp):
-            if not (i,j) in all_snippets:
-                all_snippets[i, j] = numpy.zeros(0, dtype=numpy.float32)
-            all_snippets[i, j] = all_gather_array(all_snippets[i, j], comm, shape=0, dtype='float32')
+    filename = os.path.join(tmp_path_loc, 'sp.h5')
 
-        all_snippets[i, 'noise'] = all_gather_array(all_snippets[i, 'noise'], comm, shape=0, dtype='float32')
+    if comm.rank == 0:
+        if not os.path.exists(tmp_path_loc):
+            os.makedirs(tmp_path_loc)
 
-    sps = {}  # i.e. all the scalar products
-    nsps = {}  # i.e. all the normalized scalar products
-    amplitudes = {}  # i.e. all the amplitudes
+        if os.path.exists(filename):
+            os.remove(filename)
 
-    # We need to gather all amplitudes accross nodes
-    for i in range(nb_temp):
-        for j in range(nb_temp):
-            sps[i, j] = all_snippets[i, j]
-            nsps[i, j] = sps[i, j] / norm_templates[i]
-            amplitudes[i, j] = sps[i, j] / norm_2[i]
+        hfile = h5py.File(filename, 'w', libver='earliest')
 
-        amplitudes[i, 'noise'] = all_snippets[i, 'noise'] / norm_2[i]
-    
-    del all_snippets
+    for k in ['all', 'noise']:
+
+        for key in ['x', 'data']:
+            data = numpy.concatenate(all_snippets[k].pop(key))
+            if key == 'x':
+                data = gather_array(data, comm, dtype='int32', compress=blosc_compress)
+            else:
+                data = gather_array(data, comm, dtype='float32')
+
+            # We sort by x indices for faster retrieval later
+            if comm.rank == 0:
+                if key == 'x':
+                    indices = numpy.argsort(data).astype(numpy.int32)
+                
+                data = data[indices]
+
+                if hdf5_compress:
+                    hfile.create_dataset('%s/over_%s' %(k, key), data=data, compression='gzip')
+                else:
+                    hfile.create_dataset('%s/over_%s' %(k, key), data=data)
+            del data
+
+    # We need to gather the sparse arrays.
+    if comm.rank == 0:
+        del indices
+        hfile.close()
+
+    comm.Barrier()
+    ## Once all data are saved, we need to load them with shared mpi_memory
+    if SHARED_MEMORY:
+        all_snippets, mpi_memory_2 = load_sp_memshared(filename, nb_temp)
+    else:
+        all_snippets = load_sp(filename, nb_temp)
+
+    comm.Barrier()
+    if comm.rank == 0:
+        os.remove(filename)
+
+    #del all_snippets
     # And finally, we set a_min/a_max optimally for all the template.
     purity_level = numpy.zeros(len(all_temp), dtype=numpy.float32)
     max_nb_chances = numpy.zeros(len(all_temp), dtype=numpy.float32)
@@ -1012,48 +1069,55 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
     for count, i in enumerate(all_temp):
 
         # First, we collect admissible snippets (according to their (normalized) scalar products).
-        good_values = amplitudes[i, i]
+        good_values = all_snippets[i, i]  / norm_2[i]
         center = 1 #numpy.median(good_values)
         if normalization:
-            tgt_values = nsps[i, i]
+            tgt_values = all_snippets[i, i] / norm_templates[i]
         else:
-            tgt_values = sps[i, i]
+            tgt_values = all_snippets[i, i]
 
         bad_values = {}
         neutral_values = {}
         nb_chances = numpy.zeros(all_sizes[i], dtype=numpy.int32)
         for j in range(nb_temp):
             # if (similarity[i, j] >= thr_similarity) and (i != j):
-            if i != j:
+            if i != j and mask_intersect[i, j]:
                 if normalization:
                     # Use the normalized scalar products.
-                    ref_values = nsps[j, j]  # i.e. snippets of j projected on template i
-                    values = nsps[i, j]  # i.e. snippets of j projected on template i
-                    ref2_values = nsps[j, i]  # i.e. snippets of i projected on template j
+                    ref_values = all_snippets[j, j] / norm_templates[j]  # i.e. snippets of j projected on template i
+                    values = all_snippets[i, j] / norm_templates[i]  # i.e. snippets of j projected on template i
+                    ref2_values = all_snippets[j, i]  / norm_templates[j] # i.e. snippets of i projected on template j
                 else:
                     # Use the scalar products (not normalized).
-                    ref_values = sps[j, j]  # i.e. snippets of j projected on template i
-                    values = sps[i, j]  # i.e. snippets of j projected on template i
-                    ref2_values = sps[j, i]  # i.e. snippets of i projected on template j
+                    ref_values = all_snippets[j, j]  # i.e. snippets of j projected on template i
+                    values = all_snippets[i, j]  # i.e. snippets of j projected on template i
+                    ref2_values = all_snippets[j, i]  # i.e. snippets of i projected on template j
 
                 selection = ref_values <= values  # i.e. snippets of j on which a fit with template i is tried *before* a fit with template j
-                bad_values[j] = amplitudes[i, j][selection]
+                bad_values[j] = all_snippets[i, j][selection]  / norm_2[i]
                 selection = ref_values > values   # i.e. snippets of j on which a fit with template i is tried *after* a fit with template j
-                neutral_values[j] = amplitudes[i, j][selection]
+                neutral_values[j] = all_snippets[i, j][selection] / norm_2[i]
 
                 selection = tgt_values <= ref2_values # i.e. snippets of i on which a fit with template j is tried *before* a fit with template i
                 nb_chances[selection] += 1
 
-        bad_values['noise'] = amplitudes[i, 'noise']
+        bad_values['noise'] = all_snippets[i, 'noise'] / norm_2[i]
 
-        all_bad_values = numpy.concatenate([
-            values
-            for values in bad_values.values()
-        ])
-        all_neutral_values = numpy.concatenate([
-            values
-            for values in neutral_values.values()
-        ])
+        if len(bad_values) > 0:
+            all_bad_values = numpy.concatenate([
+                values
+                for values in bad_values.values()
+            ])
+        else:
+            all_bad_values = numpy.zeros(0, dtype=numpy.float32)
+
+        if len(neutral_values) > 0:
+            all_neutral_values = numpy.concatenate([
+                values
+                for values in neutral_values.values()
+            ])
+        else:
+            all_neutral_values = numpy.zeros(0, dtype=numpy.float32)
 
         # Then we need to fix a_min and a_max to minimize the error
 
@@ -1168,7 +1232,7 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
     max_nb_chances = gather_array(max_nb_chances, comm)
 
     if SHARED_MEMORY:
-        for memory in mpi_memory:
+        for memory in mpi_memory_1 + mpi_memory_2:
             memory.Free()
 
     if comm.rank == 0:
@@ -1179,7 +1243,7 @@ def refine_amplitudes(params, nb_cpu, nb_gpu, use_gpu, normalization=True, debug
         for idx in range(comm.size):
             indices += list(numpy.arange(idx, nb_temp, comm.size))
 
-        indices = numpy.argsort(indices)
+        indices = numpy.argsort(indices).astype(numpy.int32)
 
         if fine_amplitude:
             hfile['limits'][:] = bounds[indices]
@@ -1203,6 +1267,7 @@ def delete_mixtures(params, nb_cpu, nb_gpu, use_gpu):
     template_shift = params.getint('detection', 'template_shift')
     cc_merge = params.getfloat('clustering', 'cc_merge')
     mixtures = []
+    norm = n_e * n_t
     # to_remove = []  # TODO remove (not used)?
 
     filename = params.get('data', 'file_out_suff') + '.overlap-mixtures.hdf5'
@@ -1213,6 +1278,8 @@ def delete_mixtures(params, nb_cpu, nb_gpu, use_gpu):
     inv_nodes = numpy.zeros(n_total, dtype=numpy.int32)
     inv_nodes[nodes] = numpy.arange(len(nodes))
     has_support = test_if_support(params, '')
+    adapted_cc = params.getboolean('clustering', 'adapted_cc')
+    adapted_thr = params.getint('clustering', 'adapted_thr')
 
     overlap = get_overlaps(
         params, extension='-mixtures', erase=True, normalize=True, maxoverlap=False, verbose=False, half=True,
@@ -1252,6 +1319,10 @@ def delete_mixtures(params, nb_cpu, nb_gpu, use_gpu):
 
     overlap_0 = numpy.zeros(nb_temp, dtype=numpy.float32)
     distances = numpy.zeros((nb_temp, nb_temp), dtype=numpy.int32)
+
+    if adapted_cc:
+        common_supports = load_data(params, 'common-supports')
+        exponents = numpy.exp(-common_supports/adapted_thr)
 
     for i in range(nb_temp - 1):
         data = c_overs[i].toarray()
@@ -1318,7 +1389,15 @@ def delete_mixtures(params, nb_cpu, nb_gpu, use_gpu):
                         new_template = (a1 * t_i + a2 * t_j)
                         similarity = numpy.corrcoef(t_k, new_template)[0, 1]
                         local_overlap = numpy.corrcoef(t_i, t_j)[0, 1]
-                        if similarity > cc_merge and local_overlap < 0.5:
+                        if adapted_cc:
+                            shared_support = numpy.sum(numpy.logical_or(supports[i], supports[j])*supports[k])
+                            exponent = numpy.exp(-shared_support/adapted_thr)
+                            mytest1 = similarity**exponent > cc_merge
+                            mytest2 = local_overlap**exponents[i, j] < 0.5
+                        else:
+                            mytest1 = similarity > cc_merge
+                            mytest2 = local_overlap < 0.5
+                        if mytest1 and mytest2:
                             if k not in mixtures:
                                 mixtures += [k]
                                 been_found = True

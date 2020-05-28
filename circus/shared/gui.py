@@ -158,6 +158,8 @@ class MergeWindow(QMainWindow):
         self.noise_limit = params.getfloat('merging', 'noise_limit')
         self.sparsity_limit = params.getfloat('merging', 'sparsity_limit')
         self.min_spikes = params.getint('merging', 'min_spikes')
+        self.adapted_cc = params.getboolean('clustering', 'adapted_cc')
+        self.adapted_thr = params.getint('clustering', 'adapted_thr')
 
         self.duration = io.load_data(params, 'duration')
         self.nb_bhatta_bins = 100
@@ -188,11 +190,11 @@ class MergeWindow(QMainWindow):
         self.shape = h5py.File(self.file_out_suff + '.templates%s.hdf5' % self.ext_in, libver='earliest', mode='r').get('temp_shape')[:]
         self.electrodes = io.load_data(params, 'electrodes', self.ext_in)
 
-        SHARED_MEMORY = get_shared_memory_flag(params)
+        self.SHARED_MEMORY = get_shared_memory_flag(params)
 
-        if SHARED_MEMORY:
-            self.templates, _ = io.load_data_memshared(params, 'templates', extension=self.ext_in)
-            self.clusters, _ = io.load_data_memshared(params, 'clusters-light', extension=self.ext_in)
+        if self.SHARED_MEMORY:
+            self.templates, self.mpi_memory_1 = io.load_data_memshared(params, 'templates', extension=self.ext_in)
+            self.clusters, self.mpi_memory_2 = io.load_data_memshared(params, 'clusters-light', extension=self.ext_in)
         else:
             self.templates = io.load_data(params, 'templates', self.ext_in)
             self.clusters = io.load_data(params, 'clusters-light', self.ext_in)
@@ -246,6 +248,10 @@ class MergeWindow(QMainWindow):
         self.overlap /= self.shape[0] * self.shape[1]
         self.all_merges = numpy.zeros((0, 2), dtype=numpy.int32)
         self.mpi_wait = numpy.array([0], dtype=numpy.int32)
+
+        if self.adapted_cc:
+            common_supports = io.load_data(params, 'common-supports')
+            self.exponents = numpy.exp(-common_supports/self.adapted_thr)
 
         if comm.rank > 0:
             self.listen()
@@ -391,7 +397,12 @@ class MergeWindow(QMainWindow):
         if self.mpi_wait[0] == 1:
             self.finalize(None)
         elif self.mpi_wait[0] == 2:
+            
+            if self.SHARED_MEMORY:
+                for memory in self.mpi_memory_1 + self.mpi_memory_2:
+                    memory.Free()
             sys.exit(0)
+
 
     def update_suggest_value(self):
         self.suggest_value = self.get_suggest_value.value()
@@ -549,7 +560,10 @@ class MergeWindow(QMainWindow):
 
             temp_id1 = self.to_consider[temp_id1]
             best_matches = self.to_consider[numpy.argsort(self.overlap[temp_id1, self.to_consider])[::-1]]
-            candidates = best_matches[self.overlap[temp_id1, best_matches] >= self.cc_overlap]
+            if not self.adapted_cc:
+                candidates = best_matches[self.overlap[temp_id1, best_matches] >= self.cc_overlap]
+            else:
+                candidates = best_matches[self.overlap[temp_id1, best_matches]**self.exponents[temp_id1, best_matches] >= self.cc_overlap]
 
             for temp_id2 in candidates:
 
@@ -1476,6 +1490,10 @@ class MergeWindow(QMainWindow):
 
             if self.app is not None:
                 self.app.restoreOverrideCursor()
+
+        if self.SHARED_MEMORY:
+            for memory in self.mpi_memory_1 + self.mpi_memory_2:
+                memory.Free()
 
         sys.exit(0)
 

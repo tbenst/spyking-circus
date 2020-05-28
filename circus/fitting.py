@@ -73,7 +73,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         cmt.cuda_sync_threads()
 
     if SHARED_MEMORY:
-        templates, _ = io.load_data_memshared(params, 'templates', normalize=templates_normalization, transpose=True)
+        templates, mpi_memory_1 = io.load_data_memshared(params, 'templates', normalize=templates_normalization, transpose=True)
         N_tm, x = templates.shape
     else:
         templates = io.load_data(params, 'templates')
@@ -164,7 +164,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         s_over = over_shape[1]
 
     if SHARED_MEMORY:
-        c_overs, _ = io.load_data_memshared(params, 'overlaps')
+        c_overs, mpi_memory_2 = io.load_data_memshared(params, 'overlaps')
     else:
         c_overs = io.load_data(params, 'overlaps')
 
@@ -269,6 +269,13 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         to_explore = get_tqdm_progressbar(params, to_explore)
 
     import time
+
+    if templates_normalization:
+        min_scalar_product = numpy.min(amp_limits[:, 0] * n_scalar * norm_templates[:n_tm])
+        max_scalar_product = numpy.max(amp_limits[:, 1] * n_scalar * norm_templates[:n_tm])
+    else:
+        min_scalar_product = numpy.min(amp_limits[:, 0] * norm_templates_2[:n_tm])
+        max_scalar_product = numpy.max(amp_limits[:, 1] * norm_templates_2[:n_tm])
 
     for gcount, gidx in enumerate(to_explore):
         # print "Node", comm.rank, "is analyzing chunk", gidx, "/", nb_chunks, " ..."
@@ -477,6 +484,10 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
             best_indices = numpy.zeros(0, dtype=numpy.int32)
 
             t6 = time.time()
+
+            data = b[:n_tm, :]
+            flatten_data = data.ravel()
+
             while numpy.mean(failure) < total_nb_chances:
 
                 # Is there a way to update sub_b * mask at the same time?
@@ -485,17 +496,21 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
                 else:
                     b_array = None
 
-                data = b[:n_tm, :]
-
                 if numerous_argmax:
                     if len(best_indices) == 0:
-                        best_indices = largest_indices(data, nb_argmax)
-                    best_template_index, peak_index = numpy.unravel_index(best_indices[0], data.shape)  
+                        best_indices = largest_indices(flatten_data, nb_argmax)
+
+                    best_template_index, peak_index = numpy.unravel_index(best_indices[0], data.shape)
                 else:
+                    best_indices = numpy.zeros(0, dtype=numpy.int32)
                     best_template_index, peak_index = numpy.unravel_index(data.argmax(), data.shape)
 
                 peak_scalar_product = data[best_template_index, peak_index]
                 best_template2_index = best_template_index + n_tm
+
+                if peak_scalar_product < min_scalar_product:
+                    failure[:] = total_nb_chances
+                    break
 
                 if templates_normalization:
                     if full_gpu:
@@ -557,11 +572,12 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
                         del tmp1, tmp2
                     else:
                         tmp1 = c_overs[best_template_index].multiply(-best_amp)
-                        if abs(best_amp2) > min_second_component:
+                        if numpy.abs(best_amp2_n) > min_second_component:
                             tmp1 += c_overs[best_template2_index].multiply(-best_amp2)
                         b[:, is_neighbor] += tmp1.dot(indices)
 
                     numerous_argmax = False
+                    best_indices = numpy.zeros(0, dtype=numpy.int32)
 
                     # Add matching to the result.
                     t_spike = all_spikes[peak_index]
@@ -591,20 +607,18 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
                 else:
                     # Reject the matching.
                     numerous_argmax = True
+
                     # Update failure counter of the peak.
                     failure[peak_index] += 1
                     # If the maximal number of failures is reached then mark peak as solved (i.e. not fitted).
                     if failure[peak_index] >= total_nb_chances:
                         # Mark all the matching associated to the current peak as tried.
                         b[:, peak_index] = -numpy.inf
-                        index = numpy.arange(n_tm) * nb_local_peak_times + peak_index
                     else:
                         # Mark current matching as tried.
                         b[best_template_index, peak_index] = -numpy.inf
-                        index = best_template_index * nb_local_peak_times + peak_index
-                    
-                    if numerous_argmax:
-                        best_indices = best_indices[~numpy.in1d(best_indices, index)]
+
+                    best_indices = best_indices[flatten_data[best_indices] > -numpy.inf]
 
                     # Save debug data.
                     if debug:
@@ -743,3 +757,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         io.collect_data(comm.size, params, erase=True)
 
     data_file.close()
+
+    if SHARED_MEMORY:
+        for memory in mpi_memory_1 + mpi_memory_2:
+            memory.Free()

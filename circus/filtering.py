@@ -146,10 +146,14 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
         to_explore = range(comm.rank, nb_chunks, comm.size)
 
-        data_file_in.open(mode='r+')
-
         if comm.rank == 0:
             to_explore = get_tqdm_progressbar(params, to_explore)
+
+        if data_file_in == data_file_out:
+            data_file_in.open(mode='r+')
+        else:
+            data_file_in.open(mode='r')
+            data_file_out.open(mode='r+')
 
         for count, gidx in enumerate(to_explore):
 
@@ -170,8 +174,13 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
 
             if do_filtering:
                 local_chunk = signal.filtfilt(b, a, local_chunk, axis=0)
-                local_chunk = local_chunk[numpy.abs(padding[0]):-numpy.abs(padding[1])]
                 local_chunk -= numpy.median(local_chunk, 0)
+                if not is_last:
+                    local_chunk = local_chunk[numpy.abs(padding[0]):-numpy.abs(padding[1])]
+                else:
+                    local_chunk = local_chunk[numpy.abs(padding[0]):]
+            else:
+                local_chunk = local_chunk[numpy.abs(padding[0]):-numpy.abs(padding[1])]
 
             if do_remove_median:
                 if not process_all_channels:
@@ -400,6 +409,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
         description['dtype_offset'] = 0
         description['data_offset'] = 0
 
+        comm.Barrier()
         data_file_out = params.get_data_file(is_empty=not has_been_created, params=description)
 
         if comm.rank == 0:
@@ -434,7 +444,7 @@ def main(params, nb_cpu, nb_gpu, use_gpu):
     if params.getboolean('data', 'overwrite'):
         data_file_in.open(mode='r+')
     else:
-        data_file_in.open()
+        data_file_in.open(mode='r')
         data_file_out.open(mode='r+')
 
     if do_filter or remove_median or remove_ground:
