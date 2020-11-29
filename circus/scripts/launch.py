@@ -116,6 +116,9 @@ but a subset x,y can be done. Steps are:
     parser.add_argument('-t', '--type', help='benchmark type',
                         choices=['fitting', 'clustering', 'synchrony'])
 
+    # useful for e.g. supporting spyking-circus packaged in a singularity container
+    parser.add_argument('-P', '--prepend-command', help='Commands to run before spyking-circus (e.g. for docker/singularity)', default="")
+
     if len(argv) == 0:
         parser.print_help()
         sys.exit(0)
@@ -130,8 +133,9 @@ but a subset x,y can be done. Steps are:
 
     # To save some typing later
     nb_gpu = 0
-    (nb_cpu, hostfile, batch, preview, result, extension, output, benchmark, info, second) = \
-        (args.cpu, args.hostfile, args.batch, args.preview, args.result, args.extension, args.output, args.type, args.info, args.second)
+    (nb_cpu, hostfile, batch, preview, result, extension, output, benchmark, \
+        info, second, prepend_command) = \
+        (args.cpu, args.hostfile, args.batch, args.preview, args.result, args.extension, args.output, args.type, args.info, args.second, args.prepend_command)
     filename = os.path.abspath(args.datafile)
     real_file = filename
 
@@ -290,7 +294,11 @@ but a subset x,y can be done. Steps are:
         with open(tasks_list, 'r') as f:
             for line in f:
                 if len(line) > 0:
-                    subprocess.check_call(['spyking-circus'] + line.replace('\n', '').split(" "))
+                    if prepend_command:
+                        prepend_command_str = prepend_command + " "
+                    else:
+                        prepend_command_str = ""
+                    subprocess.check_call([prepend_command_str + 'spyking-circus'] + line.replace('\n', '').split(" "))
     else:
 
         print_and_log(['Config file: %s' % (f_next + '.params')], 'debug', logger)
@@ -373,6 +381,9 @@ but a subset x,y can be done. Steps are:
                     elif command == 'mpirun':
                         # Use mpirun to make the call
                         mpi_args = gather_mpi_arguments(hostfile, params)
+                        if prepend_command!="":
+                            prepend_command_list = prepend_command.split(" ")
+                            mpi_args += prepend_command_list
                         one_cpu = False
 
                         if subtask in ['filtering', 'benchmarking'] and not is_writable:
